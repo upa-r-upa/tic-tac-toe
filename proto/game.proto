@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package tic_tac_toe;
+
+service TicTacToe {
+    rpc MakeMove (MoveRequest) returns (MoveResponse);
+    rpc GetGameState (GameStateRequest) returns (GameStateResponse);
+}
+
+message MoveRequest {
+    string player = 1;
+    int32 x = 2;
+    int32 y = 3;
+}
+
+message MoveResponse {
+    string message = 1;
+}
+
+message GameStateRequest {}
+
+message GameStateResponse {
+    repeated string board = 1;
+}
