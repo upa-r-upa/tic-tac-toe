@@ -1,0 +1,10 @@
+[package]
+name = "tic-tac-toe"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["server", "client"]
+resolver = "2"
+
+[dependencies]
