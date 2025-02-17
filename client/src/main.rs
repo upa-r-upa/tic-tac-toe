@@ -1,9 +1,8 @@
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 use std::sync::Arc;
-use tonic::transport::Channel;
 use tonic::Request;
-use tokio_stream::StreamExt;
+use std::time::Duration;
 
 use tictactoe::tic_tac_toe_client::TicTacToeClient;
 use tictactoe::{GameState, Move};
@@ -81,7 +80,6 @@ async fn process_server_updates(mut rx: tonic::Streaming<GameState>, state: Arc<
             }
         }
 
-        // 만약 할당된 심볼이 변경되었으면 업데이트
         {
             let mut sym_lock = state.player_symbol.lock().await;
             if sym_lock.is_none() || sym_lock.as_ref().unwrap() != &result.your_symbol {
@@ -92,62 +90,92 @@ async fn process_server_updates(mut rx: tonic::Streaming<GameState>, state: Arc<
 
         println!("===================\n");
     }
+    println!("Disconnected from server.");
+    let mut over = state.game_over.lock().await;
+    *over = true;
 }
 
-/// 사용자 입력 처리 함수
-async fn process_user_input(mut move_tx: mpsc::Sender<Move>, state: Arc<ClientState>) {
+/// 사용자 입력 처리 함수 (자동 종료를 위해 select! 사용)
+async fn process_user_input(move_tx: mpsc::Sender<Move>, state: Arc<ClientState>) {
     let stdin = io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
     println!("Enter your move (0-8), or type 'exit' to quit:");
-    while let Some(line) = lines.next_line().await.unwrap_or(None) {
-        let trimmed = line.trim();
-        if trimmed.eq_ignore_ascii_case("exit") {
-            break;
-        }
-
-        {
-            let over = state.game_over.lock().await;
-            if *over {
-                println!("Game is over. No more moves accepted.");
+    loop {
+        tokio::select! {
+            maybe_line = lines.next_line() => {
+                match maybe_line {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.eq_ignore_ascii_case("exit") {
+                            break;
+                        }
+                        {
+                            let over = state.game_over.lock().await;
+                            if *over {
+                                println!("Game is over. No more moves accepted.");
+                                break;
+                            }
+                        }
+                        {
+                            let status = state.game_status.lock().await;
+                            if *status == "waiting" {
+                                println!("Game has not started yet. Waiting for opponent...");
+                                continue;
+                            }
+                        }
+                        if let Ok(pos) = trimmed.parse::<usize>() {
+                            if pos < 9 {
+                                let symbol_opt = {
+                                    let lock = state.player_symbol.lock().await;
+                                    lock.clone()
+                                };
+                                if let Some(symbol) = symbol_opt {
+                                    let mv = Move {
+                                        player_id: symbol.clone(),
+                                        position: pos as i32,
+                                    };
+                                    if let Err(e) = move_tx.send(mv).await {
+                                        eprintln!("Error sending move: {:?}", e);
+                                    }
+                                } else {
+                                    println!("You haven't been assigned a symbol yet. Please wait for the server update.");
+                                }
+                            } else {
+                                println!("Invalid move. Please enter a number between 0 and 8.");
+                            }
+                        } else {
+                            println!("Invalid input. Please enter a number between 0 and 8, or 'exit'.");
+                        }
+                    },
+                    Ok(None) => {
+                        // EOF
+                        break;
+                    },
+                    Err(e) => {
+                        eprintln!("Error reading input: {:?}", e);
+                        break;
+                    }
+                }
+            },
+            _ = async {
+                loop {
+                    {
+                        let over = state.game_over.lock().await;
+                        if *over {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => {
+                println!("Game session ended due to disconnection.");
                 break;
             }
         }
-
-        {
-            let status = state.game_status.lock().await;
-            if *status == "waiting" {
-                println!("Game has not started yet. Waiting for opponent...");
-                continue;
-            }
-        }
-
-        if let Ok(pos) = trimmed.parse::<usize>() {
-            if pos < 9 {
-                let symbol_opt = {
-                    let lock = state.player_symbol.lock().await;
-                    lock.clone()
-                };
-                if let Some(symbol) = symbol_opt {
-                    let mv = Move {
-                        player_id: symbol.clone(),
-                        position: pos as i32,
-                    };
-                    if let Err(e) = move_tx.send(mv).await {
-                        eprintln!("Error sending move: {:?}", e);
-                    }
-                } else {
-                    println!("You haven't been assigned a symbol yet. Please wait for the server update.");
-                }
-            } else {
-                println!("Invalid move. Please enter a number between 0 and 8.");
-            }
-        } else {
-            println!("Invalid input. Please enter a number between 0 and 8, or 'exit'.");
-        }
     }
-    println!("Exiting game.");
+    println!("Exiting game session.");
 }
 
 /// 메인 게임 실행 함수
@@ -173,7 +201,12 @@ async fn run_game() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 메인 함수: 게임 종료 후 터미널 종료
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_game().await
+    if let Err(e) = run_game().await {
+        eprintln!("Error in game session: {:?}", e);
+    }
+    println!("Game session ended. Exiting.");
+    Ok(())
 }
