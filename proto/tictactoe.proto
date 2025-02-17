@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package tictactoe;
+
+service TicTacToe {
+  // 양방향 스트리밍 RPC: 클라이언트는 Move를 보내고, 서버는 GameState를 스트리밍으로 반환합니다.
+  rpc Play(stream Move) returns (stream GameState);
+}
+
+message Move {
+  // 클라이언트가 보내는 이동 정보 (player_id는 사용하지 않으며, 서버에서 할당한 심볼을 기준으로 판단합니다)
+  string player_id = 1;
+  int32 position = 2;   // 0 ~ 8 (보드 인덱스)
+}
+
+message GameState {
+  // 9칸의 보드 (각 칸은 "", "X", 또는 "O")
+  repeated string board = 1;
+  // 다음 차례 플레이어 ("X" 또는 "O")
+  string next_player = 2;
+  // 게임 상태: "waiting" (대기 중), "ongoing", "X_win", "O_win", "draw"
+  string status = 3;
+  // 해당 클라이언트에 할당된 심볼 ("X" 또는 "O")
+  string your_symbol = 4;
+}
