@@ -22,4 +22,5 @@ message GameState {
   string status = 3;
   // 해당 클라이언트에 할당된 심볼 ("X" 또는 "O")
   string your_symbol = 4;
+  string error_message = 5;  // 새 필드 추가
 }

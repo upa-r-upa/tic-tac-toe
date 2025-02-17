@@ -1,17 +1,38 @@
 use tokio::io::{self, AsyncBufReadExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use std::sync::Arc;
 use tonic::transport::Channel;
 use tonic::Request;
+use tokio_stream::StreamExt;
+
 use tictactoe::tic_tac_toe_client::TicTacToeClient;
 use tictactoe::{GameState, Move};
-use tokio_stream::StreamExt;
 
 pub mod tictactoe {
     tonic::include_proto!("tictactoe");
 }
 
-/// 터미널에 현재 보드를 출력하는 함수
+/// 클라이언트의 공유 상태 구조체
+struct ClientState {
+    // 할당된 플레이어 심볼 ("X" 또는 "O")
+    player_symbol: Mutex<Option<String>>,
+    // 현재 게임 상태 (예: "waiting", "ongoing", "X_win", ...)
+    game_status: Mutex<String>,
+    // 게임 종료 여부 (true면 더 이상 입력을 받지 않음)
+    game_over: Mutex<bool>,
+}
+
+impl ClientState {
+    fn new() -> Self {
+        ClientState {
+            player_symbol: Mutex::new(None),
+            game_status: Mutex::new(String::new()),
+            game_over: Mutex::new(false),
+        }
+    }
+}
+
+/// 보드 출력 함수
 fn print_board(board: &Vec<String>) {
     println!("-------------");
     for i in 0..3 {
@@ -20,117 +41,99 @@ fn print_board(board: &Vec<String>) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // gRPC 서버에 연결
-    println!("Connecting to gRPC server...");
-    let mut client = TicTacToeClient::connect("http://[::1]:50051").await?;
-    
-    // gRPC 서버로 보낼 메시지를 위한 tokio 채널 생성
-    let (move_tx, move_rx) = tokio::sync::mpsc::channel(32);
-    // 채널을 스트림으로 변환
-    let outbound = tokio_stream::wrappers::ReceiverStream::new(move_rx);
-    
-    // 양방향 스트리밍 호출 (outbound 스트림을 서버로 전송)
-    let response = client.play(Request::new(outbound)).await?;
-    // into_parts()는 (metadata, Streaming<GameState>, extensions)를 반환합니다.
-    let (_metadata, mut rx, _extensions) = response.into_parts();
+/// 서버 업데이트 처리 함수
+async fn process_server_updates(mut rx: tonic::Streaming<GameState>, state: Arc<ClientState>) {
+    while let Some(result) = rx.message().await.unwrap_or(None) {
+        {
+            let mut status = state.game_status.lock().await;
+            *status = result.status.clone();
+        }
 
-    // 플레이어가 할당된 심볼("X" 또는 "O")을 저장하는 공유 변수
-    let player_symbol = Arc::new(Mutex::new(None));
-    // 게임 종료 여부를 저장하는 공유 변수 (false: 진행 중, true: 종료)
-    let game_over = Arc::new(Mutex::new(false));
-    // 게임 상태("waiting", "ongoing", "X_win", "O_win", "draw")를 저장하는 공유 변수
-    let game_status = Arc::new(Mutex::new(String::new()));
+        println!("\n=== Game Update ===");
 
-    // 서버로부터 오는 게임 상태 업데이트를 수신하는 태스크
-    {
-        let player_symbol_clone = Arc::clone(&player_symbol);
-        let game_over_clone = Arc::clone(&game_over);
-        let game_status_clone = Arc::clone(&game_status);
-        tokio::spawn(async move {
-            while let Some(game_state) = rx.message().await.unwrap_or(None) {
-                // 업데이트 받은 게임 상태를 전역 상태에 저장
-                {
-                    let mut status_lock = game_status_clone.lock().await;
-                    *status_lock = game_state.status.clone();
-                }
-                println!("\n=== Game Update ===");
-                if game_state.status == "waiting" {
-                    // waiting 상태: 상대방 대기 메시지 출력
+        if !result.error_message.is_empty() {
+            println!("Error: {}", result.error_message);
+        }
+
+        match result.status.as_str() {
+            "waiting" => {
+                let symbol = state.player_symbol.lock().await.clone();
+                if symbol.is_some() {
+                    println!("Opponent disconnected. Waiting for opponent to join...");
+                } else {
                     println!("Waiting for opponent to join...");
-                } else if game_state.status == "ongoing" {
-                    // ongoing 상태: 보드와 정보를 출력
-                    print_board(&game_state.board);
-                    println!("Next Player: {}", game_state.next_player);
-                    println!("Your Symbol: {}", game_state.your_symbol);
-                } else if game_state.status == "X_win" 
-                       || game_state.status == "O_win" 
-                       || game_state.status == "draw" {
-                    // 게임 종료 상태: 보드와 종료 메시지 출력
-                    print_board(&game_state.board);
-                    println!("Game Over: {}", game_state.status);
-                    let mut over_lock = game_over_clone.lock().await;
-                    *over_lock = true;
-                    break;
                 }
-                // 할당된 심볼이 없으면, 할당해줌.
-                {
-                    let mut sym_lock = player_symbol_clone.lock().await;
-                    if sym_lock.is_none() {
-                        *sym_lock = Some(game_state.your_symbol.clone());
-                        println!("You are assigned: {}", game_state.your_symbol);
-                    }
-                }
-                println!("===================\n");
+            },
+            "ongoing" => {
+                print_board(&result.board);
+                println!("Next Player: {}", result.next_player);
+                println!("Your Symbol: {}", result.your_symbol);
+            },
+            "X_win" | "O_win" | "draw" => {
+                print_board(&result.board);
+                println!("Game Over: {}", result.status);
+                let mut over = state.game_over.lock().await;
+                *over = true;
+                break;
+            },
+            _ => {
+                println!("Status: {}", result.status);
             }
-        });
-    }
+        }
 
-    // 터미널 입력(BufReader)을 통해 사용자 입력 처리
+        // 만약 할당된 심볼이 변경되었으면 업데이트
+        {
+            let mut sym_lock = state.player_symbol.lock().await;
+            if sym_lock.is_none() || sym_lock.as_ref().unwrap() != &result.your_symbol {
+                *sym_lock = Some(result.your_symbol.clone());
+                println!("Your symbol has been updated to: {}", result.your_symbol);
+            }
+        }
+
+        println!("===================\n");
+    }
+}
+
+/// 사용자 입력 처리 함수
+async fn process_user_input(mut move_tx: mpsc::Sender<Move>, state: Arc<ClientState>) {
     let stdin = io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
     println!("Enter your move (0-8), or type 'exit' to quit:");
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = lines.next_line().await.unwrap_or(None) {
         let trimmed = line.trim();
         if trimmed.eq_ignore_ascii_case("exit") {
             break;
         }
 
-        // 게임 종료 여부를 체크
         {
-            let over = game_over.lock().await;
+            let over = state.game_over.lock().await;
             if *over {
                 println!("Game is over. No more moves accepted.");
                 break;
             }
         }
-        // waiting 상태이면 입력받지 않음
+
         {
-            let status = game_status.lock().await;
+            let status = state.game_status.lock().await;
             if *status == "waiting" {
                 println!("Game has not started yet. Waiting for opponent...");
                 continue;
             }
         }
 
-        // 입력값이 숫자인지 확인
         if let Ok(pos) = trimmed.parse::<usize>() {
             if pos < 9 {
-                // 플레이어 심볼 확인
                 let symbol_opt = {
-                    let lock = player_symbol.lock().await;
+                    let lock = state.player_symbol.lock().await;
                     lock.clone()
                 };
                 if let Some(symbol) = symbol_opt {
-                    // 서버로 보낼 Move 메시지 생성
                     let mv = Move {
                         player_id: symbol.clone(),
                         position: pos as i32,
                     };
-                    // 메시지를 서버로 전송
                     if let Err(e) = move_tx.send(mv).await {
                         eprintln!("Error sending move: {:?}", e);
                     }
@@ -144,7 +147,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Invalid input. Please enter a number between 0 and 8, or 'exit'.");
         }
     }
-
     println!("Exiting game.");
+}
+
+/// 메인 게임 실행 함수
+async fn run_game() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Connecting to gRPC server...");
+    let mut client = TicTacToeClient::connect("http://[::1]:50051").await?;
+
+    let (move_tx, move_rx) = mpsc::channel(32);
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(move_rx);
+
+    let response = client.play(Request::new(outbound)).await?;
+    let (_metadata, rx, _extensions) = response.into_parts();
+
+    let client_state = Arc::new(ClientState::new());
+
+    let state_clone = Arc::clone(&client_state);
+    tokio::spawn(async move {
+        process_server_updates(rx, state_clone).await;
+    });
+
+    process_user_input(move_tx, client_state).await;
+
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run_game().await
 }

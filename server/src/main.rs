@@ -11,46 +11,48 @@ pub mod tictactoe {
 use tictactoe::tic_tac_toe_server::{TicTacToe, TicTacToeServer};
 use tictactoe::{GameState, Move};
 
-/// 스트리밍 응답 타입 alias
+/// 서버에서 클라이언트로 전송할 스트림 타입
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<GameState, Status>> + Send>>;
 
-/// 각 클라이언트 연결을 나타내는 구조체 (플레이어 심볼과 해당 채널)
+////////////////////////////
+// 1. 데이터 구조체 및 헬퍼 //
+////////////////////////////
+
+/// 각 플레이어의 연결 정보를 저장합니다.
+#[derive(Clone)]
 struct PlayerConnection {
-    symbol: String, // "X" 또는 "O"
-    tx: mpsc::Sender<GameState>,
+    symbol: String,              // "X" 또는 "O"
+    tx: mpsc::Sender<GameState>, // 업데이트 전송 채널
 }
 
-/// 게임 전체 상태를 공유하는 구조체  
-/// - board: 9칸 보드 ("" 또는 "X", "O")  
-/// - next_player: 다음 차례 ("X" 또는 "O")  
-/// - status: "waiting", "ongoing", "X_win", "O_win", "draw"  
-/// - player_x/player_o: 각각의 플레이어 연결 (없으면 None)
+/// 게임의 전체 상태를 저장하는 구조체입니다.
 #[derive(Default)]
 struct SharedGame {
-    board: Vec<String>,
-    next_player: String,
-    status: String,
+    board: Vec<String>,       // 9칸 보드 (각 칸: "", "X", "O")
+    next_player: String,      // 다음 차례 ("X" 또는 "O")
+    status: String,           // "waiting", "ongoing", "X_win", "O_win", "draw"
     player_x: Option<PlayerConnection>,
     player_o: Option<PlayerConnection>,
 }
 
 impl SharedGame {
+    /// 초기 게임 상태 생성
     fn new() -> Self {
         SharedGame {
             board: vec!["".into(); 9],
             next_player: "X".into(),
-            status: "waiting".into(), // 플레이어가 2명 모일 때까지 대기
+            status: "waiting".into(),
             player_x: None,
             player_o: None,
         }
     }
 
-    /// 보드가 꽉 찼는지 검사
+    /// 보드가 가득 찼는지 검사
     fn is_full(&self) -> bool {
         self.board.iter().all(|cell| !cell.is_empty())
     }
 
-    /// 승리 조건 검사 (가로, 세로, 대각선)
+    /// 승리 조건 검사
     fn check_winner(&self) -> Option<String> {
         let b = &self.board;
         let lines = [
@@ -63,16 +65,61 @@ impl SharedGame {
             (0, 4, 8),
             (2, 4, 6),
         ];
-        for &(a, b_idx, c) in lines.iter() {
+        for &(a, b_idx, c) in &lines {
             if !b[a].is_empty() && b[a] == b[b_idx] && b[b_idx] == b[c] {
                 return Some(b[a].clone());
             }
         }
         None
     }
+
+    /// 현재 게임 상태를 기반으로 기본 업데이트 메시지를 생성
+    fn create_update(&self) -> GameState {
+        GameState {
+            board: self.board.clone(),
+            next_player: self.next_player.clone(),
+            status: self.status.clone(),
+            your_symbol: String::new(), // 각 클라이언트마다 개별 설정 예정
+            error_message: "".into(),    // 기본적으로 오류 메시지는 비어 있음
+        }
+    }
+
+    /// 모든 연결된 플레이어에게 업데이트 메시지 전송
+    async fn broadcast_update(&self) {
+        let mut update = self.create_update();
+        if let Some(ref player_x) = self.player_x {
+            update.your_symbol = player_x.symbol.clone();
+            let _ = player_x.tx.send(update.clone()).await;
+        }
+        if let Some(ref player_o) = self.player_o {
+            update.your_symbol = player_o.symbol.clone();
+            let _ = player_o.tx.send(update.clone()).await;
+        }
+    }
+
+    /// 지정된 플레이어에게 오류 메시지를 전송합니다.
+    async fn send_error(&self, symbol: &str, error_msg: &str) {
+        let mut update = self.create_update();
+        update.status = "error".into(); // 오류 상태로 설정
+        update.error_message = error_msg.to_string();
+        update.your_symbol = symbol.to_string();
+        if symbol == "X" {
+            if let Some(ref player_x) = self.player_x {
+                let _ = player_x.tx.send(update).await;
+            }
+        } else if symbol == "O" {
+            if let Some(ref player_o) = self.player_o {
+                let _ = player_o.tx.send(update).await;
+            }
+        }
+    }
 }
 
-/// gRPC 서비스 구현 구조체 (SharedGame를 공유)
+////////////////////////////
+// 2. gRPC 서비스 구현     //
+////////////////////////////
+
+/// gRPC 서비스 구조체 (게임 상태 공유)
 #[derive(Clone)]
 struct TicTacToeService {
     game: Arc<Mutex<SharedGame>>,
@@ -87,139 +134,88 @@ impl TicTacToe for TicTacToeService {
         request: Request<tonic::Streaming<Move>>,
     ) -> Result<Response<Self::PlayStream>, Status> {
         println!("새 클라이언트 접속: {:?}", request.remote_addr());
-        
-        // 클라이언트로 게임 상태 업데이트를 보내기 위한 채널 생성
         let (tx, rx) = mpsc::channel(32);
         let mut assigned_symbol = String::new();
 
+        // 플레이어 할당 및 초기 상태 전송
         {
-            // 게임 상태를 잠금하여 플레이어 할당
             let mut game = self.game.lock().await;
             if game.player_x.is_none() {
                 assigned_symbol = "X".to_string();
                 game.player_x = Some(PlayerConnection {
-                    symbol: "X".to_string(),
+                    symbol: assigned_symbol.clone(),
                     tx: tx.clone(),
                 });
                 println!("플레이어 X 할당");
-                
-                // 첫 번째 플레이어에게 초기 상태 전송
-                let initial_state = GameState {
+                let init_state = GameState {
                     board: game.board.clone(),
                     next_player: game.next_player.clone(),
                     status: game.status.clone(),
                     your_symbol: assigned_symbol.clone(),
+                    error_message: "".into(),
                 };
-                if let Err(e) = tx.clone().try_send(initial_state) {
-                    println!("초기 상태 전송 에러: {:?}", e);
-                }
+                let _ = tx.clone().try_send(init_state);
             } else if game.player_o.is_none() {
                 assigned_symbol = "O".to_string();
                 game.player_o = Some(PlayerConnection {
-                    symbol: "O".to_string(),
+                    symbol: assigned_symbol.clone(),
                     tx: tx.clone(),
                 });
-                // 두 번째 플레이어가 들어오면 게임 시작
                 game.status = "ongoing".to_string();
                 println!("플레이어 O 할당, 게임 시작 (ongoing)");
-
-                // 업데이트 메시지 준비 (모든 플레이어에게 전송)
-                let update = GameState {
-                    board: game.board.clone(),
-                    next_player: game.next_player.clone(),
-                    status: game.status.clone(),
-                    your_symbol: "".to_string(), // 각 클라이언트에 맞게 수정될 예정
-                };
-                // 첫 번째 플레이어 업데이트
-                if let Some(ref player_x) = game.player_x {
-                    let mut update_x = update.clone();
-                    update_x.your_symbol = player_x.symbol.clone();
-                    let _ = player_x.tx.send(update_x).await;
-                }
-                // 두 번째 플레이어 업데이트
-                if let Some(ref player_o) = game.player_o {
-                    let mut update_o = update.clone();
-                    update_o.your_symbol = player_o.symbol.clone();
-                    let _ = player_o.tx.send(update_o).await;
-                }
+                game.broadcast_update().await;
             } else {
-                // 이미 두 플레이어가 접속한 경우 에러 반환
-                return Err(Status::resource_exhausted(
-                    "이미 두 명의 플레이어가 접속되어 있습니다.",
-                ));
+                return Err(Status::resource_exhausted("이미 두 명의 플레이어가 접속되어 있습니다."));
             }
         }
 
-        // 클라이언트의 move 스트림을 처리하기 위해 게임 상태 클론과 할당 심볼 저장
+        // 클라이언트가 보내는 이동(Move) 메시지 처리
         let game_clone = self.game.clone();
         let symbol_clone = assigned_symbol.clone();
         let mut inbound = request.into_inner();
 
-        // 클라이언트로부터 들어오는 메시지(이동)를 처리하는 태스크 스폰
         tokio::spawn(async move {
             while let Some(result) = inbound.message().await.transpose() {
                 match result {
                     Ok(mv) => {
-                        println!(
-                            "플레이어 {}가 {}번 칸에 두려 함",
-                            symbol_clone, mv.position
-                        );
+                        println!("플레이어 {}가 {}번 칸에 두려 함", symbol_clone, mv.position);
                         let mut game = game_clone.lock().await;
-                        // 게임이 진행 중인지 확인
+                        // 게임이 진행 중인지 검사
                         if game.status != "ongoing" {
-                            println!("게임 상태가 진행중이 아님");
+                            println!("게임이 진행 중이 아님");
+                            game.send_error(&symbol_clone, "Game is not ongoing.").await;
                             continue;
                         }
-                        // 해당 플레이어의 차례인지 확인
+                        // 차례 확인
                         if game.next_player != symbol_clone {
-                            println!("현재 차례가 아님: {}", symbol_clone);
+                            println!("현재 차례 아님: {}", symbol_clone);
+                            game.send_error(&symbol_clone, "It's not your turn.").await;
                             continue;
                         }
-                        // 올바른 위치(0~8)인지 및 빈 칸인지 확인
                         let pos = mv.position as usize;
+                        // 위치 유효성 검사
                         if pos >= 9 {
                             println!("잘못된 위치: {}", pos);
+                            game.send_error(&symbol_clone, "Invalid position.").await;
                             continue;
                         }
                         if !game.board[pos].is_empty() {
                             println!("칸 {}이 이미 채워짐", pos);
+                            game.send_error(&symbol_clone, "Cell already occupied.").await;
                             continue;
                         }
                         // 이동 적용
                         game.board[pos] = symbol_clone.clone();
-
-                        // 승리 검사
+                        // 승리 검사 및 상태 업데이트
                         if let Some(winner) = game.check_winner() {
                             game.status = format!("{}_win", winner);
                         } else if game.is_full() {
                             game.status = "draw".to_string();
                         } else {
-                            // 차례 변경
-                            game.next_player = if symbol_clone == "X" {
-                                "O".into()
-                            } else {
-                                "X".into()
-                            };
+                            game.next_player = if symbol_clone == "X" { "O".into() } else { "X".into() };
                         }
-
-                        // 업데이트 메시지 준비 (각 클라이언트에 맞게 your_symbol을 채워 전송)
-                        let update = GameState {
-                            board: game.board.clone(),
-                            next_player: game.next_player.clone(),
-                            status: game.status.clone(),
-                            your_symbol: "".to_string(),
-                        };
-
-                        if let Some(ref player_x) = game.player_x {
-                            let mut update_x = update.clone();
-                            update_x.your_symbol = player_x.symbol.clone();
-                            let _ = player_x.tx.send(update_x).await;
-                        }
-                        if let Some(ref player_o) = game.player_o {
-                            let mut update_o = update.clone();
-                            update_o.your_symbol = player_o.symbol.clone();
-                            let _ = player_o.tx.send(update_o).await;
-                        }
+                        // 모든 플레이어에게 업데이트 전송
+                        game.broadcast_update().await;
                     }
                     Err(e) => {
                         println!("메시지 수신 에러: {:?}", e);
@@ -228,37 +224,23 @@ impl TicTacToe for TicTacToeService {
                 }
             }
             println!("플레이어 {} 접속 종료", symbol_clone);
-            // 접속 종료 시 해당 플레이어 제거 및 게임 초기화
             let mut game = game_clone.lock().await;
-            if game
-                .player_x
-                .as_ref()
-                .map(|p| p.symbol.clone())
-                == Some(symbol_clone.clone())
-            {
-                game.player_x = None;
-            }
-            if game
-                .player_o
-                .as_ref()
-                .map(|p| p.symbol.clone())
-                == Some(symbol_clone.clone())
-            {
-                game.player_o = None;
-            }
+            
+            game.player_x = None;
+            game.player_o = None;
             game.board = vec!["".into(); 9];
             game.next_player = "X".into();
-            game.status = "waiting".into();
+            game.status = "waiting".to_string();
         });
 
-        // 클라이언트에 대해 ReceiverStream을 생성하여 gRPC 응답 스트림으로 반환
-        let output_stream = Box::pin(
-            ReceiverStream::new(rx)
-                .map(|state| Ok(state)) // 각 GameState를 Ok(GameState)로 매핑
-        );
+        let output_stream = Box::pin(ReceiverStream::new(rx).map(|state| Ok(state)));
         Ok(Response::new(output_stream))
     }
 }
+
+////////////////////////////
+// 3. 서버 실행           //
+////////////////////////////
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
